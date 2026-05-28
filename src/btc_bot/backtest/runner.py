@@ -133,22 +133,25 @@ class BacktestRunner:
 
             # ── Manage open trade ──────────────────────────────────
             if open_trade is not None:
-                exit_price, pnl, r, unrealistic = self._check_exit(
+                exit_price, gross, net, slip_cost, r, unrealistic = self._check_exit(
                     open_trade, candle, fee_pct, slip_pct
                 )
                 if exit_price is not None:
-                    account = record_trade_result(account, pnl, self.risk_limits)
+                    account = record_trade_result(account, net, self.risk_limits)
                     account = replace(account, open_positions=0)
+                    exit_fee = open_trade["qty"] * exit_price * fee_pct
                     metrics.total_trades += 1
                     metrics.r_multiples.append(r)
-                    metrics.net_pnl += pnl
-                    metrics.total_fees += open_trade["entry_fee"] + abs(pnl) * fee_pct * 2
+                    metrics.gross_pnl += gross
+                    metrics.net_pnl += net
+                    metrics.total_fees += open_trade["entry_fee"] + exit_fee
+                    metrics.total_slippage += open_trade["entry_slip"] + slip_cost
                     if r > 0:
                         metrics.wins += 1
                     else:
                         metrics.losses += 1
                     if unrealistic:
-                        metrics.unrealistic_fill_pnl += max(pnl, 0)
+                        metrics.unrealistic_fill_pnl += max(net, 0)
                     metrics.equity_curve.append(account.equity)
                     open_trade = None
                     continue
@@ -182,6 +185,7 @@ class BacktestRunner:
                 "qty": decision.sizing.qty,
                 "stop_dist": signal.entry - signal.stop,
                 "entry_fee": fee,
+                "entry_slip": slip_cost,
                 "unrealistic": unrealistic,
             }
             account = replace(account, open_positions=1)
@@ -194,7 +198,8 @@ class BacktestRunner:
         candle: pd.Series,
         fee_pct: float,
         slip_pct: float,
-    ) -> tuple[float | None, float, float, bool]:
+    ) -> tuple[float | None, float, float, float, float, bool]:
+        """Return (exit_price, gross, net, slip_cost, r, unrealistic) or (None, 0, 0, 0, 0, False)."""
         low = float(candle["low"])
         high = float(candle["high"])
         stop = trade["stop"]
@@ -203,19 +208,22 @@ class BacktestRunner:
         qty = trade["qty"]
 
         if low <= stop:
-            exit_price = stop
+            # Apply slippage against the trader (price moves away on SL)
+            exit_price = stop * (1 - slip_pct)
             gross = (exit_price - entry) * qty
-            fee = qty * exit_price * fee_pct
-            net = gross - fee - qty * entry * fee_pct
+            slip_cost = stop * slip_pct * qty
+            fee = qty * exit_price * fee_pct + qty * entry * fee_pct
+            net = gross - fee
             r = (exit_price - entry) / trade["stop_dist"]
-            return exit_price, net, r, trade["unrealistic"]
+            return exit_price, gross, net, slip_cost, r, trade["unrealistic"]
 
         if high >= target:
-            exit_price = target
+            exit_price = target * (1 - slip_pct)
             gross = (exit_price - entry) * qty
-            fee = qty * exit_price * fee_pct
-            net = gross - fee - qty * entry * fee_pct
+            slip_cost = target * slip_pct * qty
+            fee = qty * exit_price * fee_pct + qty * entry * fee_pct
+            net = gross - fee
             r = (exit_price - entry) / trade["stop_dist"]
-            return exit_price, net, r, trade["unrealistic"]
+            return exit_price, gross, net, slip_cost, r, trade["unrealistic"]
 
-        return None, 0.0, 0.0, False
+        return None, 0.0, 0.0, 0.0, 0.0, False

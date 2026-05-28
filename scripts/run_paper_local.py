@@ -26,7 +26,19 @@ def main():
         print(f"Mode is {settings.mode.value}. Set MODE=paper_local in .env to run paper trading.")
         sys.exit(1)
 
-    runner = PaperRunner(settings)
+    adapter = None
+    if settings.mode == Mode.paper_testnet:
+        from btc_bot.exchange.binance_spot import BinanceSpotAdapter
+        if not settings.testnet_api_key:
+            print("paper_testnet requires TESTNET_API_KEY and TESTNET_API_SECRET in .env")
+            sys.exit(1)
+        adapter = BinanceSpotAdapter(
+            api_key=settings.testnet_api_key,
+            api_secret=settings.testnet_api_secret,
+            testnet=True,
+        )
+
+    runner = PaperRunner(settings, adapter=adapter)
     runner.run()
 
 

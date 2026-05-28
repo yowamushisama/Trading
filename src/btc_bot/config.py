@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     news_tagger: NewsTagger = NewsTagger.keyword
     news_cooldown_minutes: int = 30
 
+    # ── Capital ───────────────────────────────────────────────────
+    paper_capital_usdt: float = Field(10_000.0, gt=0)
+    live_capital_cap_usdt: float = Field(0.0, ge=0)  # 0 = use full account balance
+
     # ── Risk ──────────────────────────────────────────────────────
     risk_per_trade_pct: float = Field(0.0025, gt=0, le=0.02)
     daily_loss_cap_pct: float = Field(0.015, gt=0, le=0.10)

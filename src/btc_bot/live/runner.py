@@ -17,10 +17,14 @@ from btc_bot.risk.account import AccountLimits, AccountState, record_trade_resul
 from btc_bot.risk.engine import RiskEngine
 from btc_bot.risk.fees import FeeEstimate
 from btc_bot.risk.kill_switch import KillSwitchState
+from btc_bot.storage import db as _db
+from btc_bot.storage.repos import get_state, set_state
 from btc_bot.strategy.scalper import ScalperStrategy
 from btc_bot.strategy.swing import SwingStrategy
 from btc_bot.utils.halt import is_halted
 from btc_bot.utils.time import utcnow
+
+_RAMP_UP_STATE_KEY = "live_first_started_at"
 
 # First 30 days of live trading: enforce 10% size cap in code (not config)
 LIVE_RAMP_UP_PCT = 0.10
@@ -43,6 +47,7 @@ class LiveRunner:
             cooldown_hours=settings.consec_loss_cooldown_hours,
             max_open_positions=settings.max_open_positions,
             min_rr=settings.min_rr,
+            max_risk_per_trade_pct=settings.risk_per_trade_pct,
         )
         self.engine = RiskEngine(
             account_limits=self.limits,
@@ -67,7 +72,22 @@ class LiveRunner:
             self.strategies.append(SwingStrategy(
                 atr_stop_k=settings.atr_stop_k, min_rr=settings.min_rr
             ))
-        self._started_at = utcnow()
+        _db.init_db(settings.database_url)
+        self._session = _db.get_session
+        self._started_at = self._load_or_create_start_time()
+
+    def _load_or_create_start_time(self) -> datetime:
+        """Return the persisted first-start time, creating it on first run."""
+        with self._session() as s:
+            saved = get_state(s, _RAMP_UP_STATE_KEY)
+            if saved:
+                ts = datetime.fromisoformat(saved["ts"])
+                logger.info(f"Ramp-up clock resumed — first started at {ts.date()}")
+                return ts
+            now = utcnow()
+            set_state(s, _RAMP_UP_STATE_KEY, {"ts": now.isoformat()})
+            logger.info("Ramp-up clock started — first live run recorded.")
+            return now
 
     def _is_ramp_up(self) -> bool:
         return (utcnow() - self._started_at).days < LIVE_RAMP_UP_DAYS
@@ -75,6 +95,9 @@ class LiveRunner:
     def _get_account_state(self) -> AccountState:
         usdt = self.adapter.get_balance("USDT")
         equity = usdt.free + usdt.locked
+        cap = self.settings.live_capital_cap_usdt
+        if cap > 0:
+            equity = min(equity, cap)
         return AccountState(
             equity=equity,
             starting_equity_today=equity,
@@ -103,7 +126,9 @@ class LiveRunner:
             f"ramp_up={self._is_ramp_up()}"
         )
 
+        logger.info(f"Fetching exchange filters for {self.settings.symbol}")
         filters = self.adapter.get_exchange_filters(self.settings.symbol)
+        logger.info(f"Exchange filters loaded. Entering main loop (30s cadence).")
 
         while True:
             # ── Halt check (every iteration) ──────────────────────
@@ -117,8 +142,11 @@ class LiveRunner:
             # ── Protection timeout check ───────────────────────────
             self.order_manager.check_protection_timeout(self._emergency_flatten)
 
+            logger.debug(f"Loop tick — {utcnow().strftime('%H:%M:%S UTC')}")
+
             try:
                 account = self._get_account_state()
+                logger.info(f"Account equity={account.equity:.2f} USDT")
                 risk_pct = self.settings.risk_per_trade_pct
                 if self._is_ramp_up():
                     risk_pct *= LIVE_RAMP_UP_PCT
@@ -148,6 +176,7 @@ class LiveRunner:
 
                     signal = strategy.on_candles(exec_df, confirm_df, regime_df)
                     if signal is None:
+                        logger.info(f"[{strategy.name}] No signal this tick")
                         continue
 
                     decision = self.engine.evaluate(signal, account, filters, risk_pct)

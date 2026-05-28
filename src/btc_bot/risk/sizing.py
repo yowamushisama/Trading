@@ -74,11 +74,14 @@ class ExchangeFilters:
 
 
 def round_step(value: float, step: float) -> float:
-    """Round down to the nearest step size."""
+    """Round down to the nearest step size using integer-factor arithmetic to avoid float drift."""
     if step <= 0:
         return value
     precision = max(0, round(-math.log10(step)))
-    return round(math.floor(value / step) * step, precision)
+    factor = 10 ** precision
+    # Multiply to integer domain, floor, divide back — avoids n*step float accumulation
+    n = int(math.floor(round(value * factor, 2)))
+    return round(n / factor, precision)
 
 
 def round_tick(value: float, tick: float) -> float:

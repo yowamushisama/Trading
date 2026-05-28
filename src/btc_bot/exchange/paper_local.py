@@ -28,6 +28,7 @@ class PaperOrder:
     status: str = "NEW"
     qty_filled: float = 0.0
     avg_fill_price: float = 0.0
+    exit_fill_price: float = 0.0
     created_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
 
 
@@ -162,19 +163,28 @@ class PaperLocalAdapter(ExchangeAdapter):
         return filled
 
     def _fill(self, order: PaperOrder, fill_price: float, status: str = "FILLED") -> None:
-        order.status = status
-        order.qty_filled = order.qty
-        order.avg_fill_price = fill_price
         notional = order.qty * fill_price
         fee = notional * self.fee_per_side_pct
 
         if order.side == "BUY":
-            self.balances["USDT"] = self.balances.get("USDT", 0) - notional - fee
-            self.balances["BTC"] = self.balances.get("BTC", 0) + order.qty
+            cost = notional + fee
+            available_usdt = self.balances.get("USDT", 0.0)
+            if available_usdt < cost:
+                order.status = "REJECTED_INSUFFICIENT_FUNDS"
+                logger.warning(
+                    f"[PAPER] BUY {order.qty} BTC rejected: "
+                    f"USDT {available_usdt:.4f} < required {cost:.4f}"
+                )
+                return
+            self.balances["USDT"] = available_usdt - cost
+            self.balances["BTC"] = self.balances.get("BTC", 0.0) + order.qty
         else:
-            self.balances["USDT"] = self.balances.get("USDT", 0) + notional - fee
-            self.balances["BTC"] = self.balances.get("BTC", 0) - order.qty
+            self.balances["USDT"] = self.balances.get("USDT", 0.0) + notional - fee
+            self.balances["BTC"] = self.balances.get("BTC", 0.0) - order.qty
 
+        order.status = status
+        order.qty_filled = order.qty
+        order.avg_fill_price = fill_price
         logger.info(
             f"[PAPER] FILL {order.side} {order.qty} @ {fill_price:.2f} | {status} | "
             f"USDT={self.balances['USDT']:.2f} BTC={self.balances['BTC']:.6f}"
@@ -183,6 +193,7 @@ class PaperLocalAdapter(ExchangeAdapter):
     def _exit_fill(self, order: PaperOrder, fill_price: float, reason: str) -> None:
         """Close an open OTOCO position (SL or TP hit)."""
         order.status = reason
+        order.exit_fill_price = fill_price
         qty = order.qty
         notional = qty * fill_price
         fee = notional * self.fee_per_side_pct

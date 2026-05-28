@@ -115,28 +115,22 @@ class BinanceSpotAdapter(ExchangeAdapter):
         Entry limit → SL stop-limit + TP limit-maker, linked atomically.
         Falls back to logging a warning if OTOCO is not supported on this endpoint.
         """
-        try:
-            raw = self._client.create_oto_order(
-                symbol=symbol.replace("/", ""),
-                workingType="LIMIT",
-                workingSide=entry_side,
-                workingPrice=str(entry_price),
-                workingQuantity=str(entry_qty),
-                workingTimeInForce="GTC",
-                pendingSide="SELL",
-                pendingQuantity=str(entry_qty),
-                pendingAboveType="LIMIT_MAKER",
-                pendingAbovePrice=str(take_profit_price),
-                pendingBelowType="STOP_LOSS",
-                pendingBelowStopPrice=str(stop_price),
-                listClientOrderId=list_client_id,
-            )
-            return raw
-        except Exception as e:
-            logger.warning(
-                f"OTOCO not available ({e}). Bot will use fallback OCO after entry fill."
-            )
-            return {}
+        raw = self._client.create_oto_order(
+            symbol=symbol.replace("/", ""),
+            workingType="LIMIT",
+            workingSide=entry_side,
+            workingPrice=str(entry_price),
+            workingQuantity=str(entry_qty),
+            workingTimeInForce="GTC",
+            pendingSide="SELL",
+            pendingQuantity=str(entry_qty),
+            pendingAboveType="LIMIT_MAKER",
+            pendingAbovePrice=str(take_profit_price),
+            pendingBelowType="STOP_LOSS",
+            pendingBelowStopPrice=str(stop_price),
+            listClientOrderId=list_client_id,
+        )
+        return raw
 
     def cancel_order(self, symbol: str, client_order_id: str) -> OrderResult:
         raw = self._client.cancel_order(

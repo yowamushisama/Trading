@@ -21,12 +21,13 @@ class AccountState:
 
 @dataclass(frozen=True)
 class AccountLimits:
-    daily_loss_cap_pct: float    # e.g. 0.015
-    weekly_loss_cap_pct: float   # e.g. 0.04
-    max_consec_losses: int       # e.g. 3
-    cooldown_hours: int          # e.g. 4
-    max_open_positions: int      # e.g. 1
-    min_rr: float = 1.5          # minimum reward:risk ratio
+    daily_loss_cap_pct: float       # e.g. 0.015
+    weekly_loss_cap_pct: float      # e.g. 0.04
+    max_consec_losses: int          # e.g. 3
+    cooldown_hours: int             # e.g. 4
+    max_open_positions: int         # e.g. 1
+    min_rr: float = 1.5             # minimum reward:risk ratio
+    max_risk_per_trade_pct: float = 0.005  # hard per-trade risk ceiling
 
 
 def check_account_limits(
@@ -39,6 +40,13 @@ def check_account_limits(
     if state.cooldown_until is not None and now < state.cooldown_until:
         remaining = int((state.cooldown_until - now).total_seconds() / 60)
         return False, f"Consecutive-loss cooldown active — {remaining}m remaining"
+
+    # Consecutive loss hard block (guards against cooldown_until not being set)
+    if state.consecutive_losses >= limits.max_consec_losses:
+        return False, (
+            f"Consecutive loss limit reached ({state.consecutive_losses}/"
+            f"{limits.max_consec_losses}) — cooldown required before next entry"
+        )
 
     # Max open positions
     if state.open_positions >= limits.max_open_positions:

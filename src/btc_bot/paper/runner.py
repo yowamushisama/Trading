@@ -53,25 +53,25 @@ def _config_hash(settings: Settings) -> str:
 
 
 class PaperRunner:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, adapter=None) -> None:
         self.settings = settings
 
         # DB
         _db.init_db(settings.database_url)
         self._session = _db.get_session
 
-        # Exchange sim
-        self.adapter = PaperLocalAdapter(
-            initial_usdt=10_000.0,
+        # Exchange adapter — caller may inject a testnet BinanceSpotAdapter
+        self.adapter = adapter or PaperLocalAdapter(
+            initial_usdt=settings.paper_capital_usdt,
             fee_per_side_pct=settings.fee_per_side_pct,
         )
         self.kill_switch = KillSwitchState()
 
         # Account
         self.account = AccountState(
-            equity=10_000.0,
-            starting_equity_today=10_000.0,
-            starting_equity_week=10_000.0,
+            equity=settings.paper_capital_usdt,
+            starting_equity_today=settings.paper_capital_usdt,
+            starting_equity_week=settings.paper_capital_usdt,
             today=utcnow().date(),
         )
         self.limits = AccountLimits(
@@ -81,6 +81,7 @@ class PaperRunner:
             cooldown_hours=settings.consec_loss_cooldown_hours,
             max_open_positions=settings.max_open_positions,
             min_rr=settings.min_rr,
+            max_risk_per_trade_pct=settings.risk_per_trade_pct,
         )
 
         # LLM (optional)
@@ -120,6 +121,17 @@ class PaperRunner:
 
         self._daily_stats: dict = {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0}
         self._run_ids: dict[str, int] = {}
+
+        # Active order/position tracking — cleared when trade closes
+        self._active_list_id: str | None = None
+        self._active_trade_db_id: int | None = None
+        self._active_strategy_name: str | None = None
+        self._active_signal_entry: float = 0.0  # signal entry price (for DB records)
+        self._active_actual_entry: float = 0.0   # actual fill price (for PnL)
+        self._active_qty: float = 0.0
+        self._active_stop: float = 0.0
+        self._entry_filled: bool = False          # True once entry leg confirms
+        self._pending_since: datetime | None = None
 
     def run(self) -> None:
         logger.info(f"Paper trading started (paper_local) — strategies: {self.settings.strategies_list}")
@@ -164,6 +176,10 @@ class PaperRunner:
 
     def _loop_tick(self, filters) -> None:
         now = utcnow()
+
+        # Process fills for any open position before considering new signals
+        self._process_fills(now)
+
         signals = []
 
         for strategy in self.strategies:
@@ -194,7 +210,8 @@ class PaperRunner:
                 logger.error(f"Strategy {strategy.name} error: {e}")
 
         # Execute highest-priority signal (swing > scalper)
-        if signals and self.account.open_positions == 0:
+        # Also block if an entry order is already pending (not yet filled)
+        if signals and self.account.open_positions == 0 and self._active_list_id is None:
             # Prefer swing over scalper
             chosen = next((s for s in signals if s[0].name == "swing"), signals[0])
             strategy, signal, decision = chosen
@@ -243,12 +260,12 @@ class PaperRunner:
             take_profit_price=signal.target,
             list_client_id=list_id,
         )
-        self.account = replace(self.account, open_positions=1)
+        # Do NOT set open_positions here — wait for entry fill confirmation in _process_fills
 
         # Persist to DB
+        trade_db_id: int | None = None
         with self._session() as s:
             from btc_bot.storage.repos import create_order, create_order_list
-            from btc_bot.utils.time import utcnow as _now
 
             ol = create_order_list(s, list_id, "OTOCO")
             s.flush()
@@ -262,6 +279,8 @@ class PaperRunner:
                 s, strategy_name, self.settings.symbol,
                 entry_order.id, decision.sizing.qty, signal.entry,
             )
+            s.flush()
+            trade_db_id = trade.id
             set_state(s, "open_trade", {
                 "trade_id": trade.id,
                 "strategy": strategy_name,
@@ -271,10 +290,180 @@ class PaperRunner:
                 "qty": decision.sizing.qty,
             })
 
+        # Track pending order — open_positions is set when entry actually fills
+        self._active_list_id = list_id
+        self._active_trade_db_id = trade_db_id
+        self._active_strategy_name = strategy_name
+        self._active_signal_entry = signal.entry
+        self._active_actual_entry = 0.0
+        self._active_qty = decision.sizing.qty
+        self._active_stop = signal.stop
+        self._entry_filled = False
+        self._pending_since = utcnow()
+
         logger.info(
-            f"[PAPER] {strategy_name} BUY {decision.sizing.qty} BTC @ {signal.entry:.2f} "
+            f"[PAPER] {strategy_name} PENDING BUY {decision.sizing.qty} BTC @ {signal.entry:.2f} "
             f"| SL={signal.stop:.2f} TP={signal.target:.2f} | list={list_id}"
         )
+
+    def _process_fills(self, now) -> None:
+        """Check for order fills and update position state accordingly."""
+        if self._active_list_id is None:
+            return
+
+        if isinstance(self.adapter, PaperLocalAdapter):
+            self._process_fills_local(now)
+        else:
+            self._process_fills_exchange(now)
+
+    def _process_fills_local(self, now) -> None:
+        """Simulate fills via candle feed for PaperLocalAdapter."""
+        # Check for stale pending entry (not yet filled)
+        if not self._entry_filled and self._pending_since is not None:
+            is_scalper = self._active_strategy_name == "scalper"
+            stale_secs = (
+                self.settings.stale_order_seconds_scalper if is_scalper
+                else self.settings.stale_order_seconds_swing
+            )
+            if (now - self._pending_since).total_seconds() > stale_secs:
+                logger.warning(
+                    f"[PAPER] Stale entry order {self._active_list_id} "
+                    f"after {stale_secs}s — cancelling"
+                )
+                self.adapter.cancel_order(self.settings.symbol, self._active_list_id)
+                self._reset_active_state()
+                return
+
+        try:
+            price_df = fetch_candles_ccxt(
+                "binance", self.settings.symbol, "5m", now - timedelta(minutes=10)
+            )
+            if price_df is None or len(price_df) == 0:
+                return
+            last = price_df.iloc[-1]
+            candle_dict = {
+                "low": float(last["low"]),
+                "high": float(last["high"]),
+                "close": float(last["close"]),
+            }
+        except Exception as e:
+            logger.error(f"Price feed error for fill check: {e}")
+            return
+
+        filled_ids = self.adapter.on_candle(candle_dict)
+        order = self.adapter._orders.get(self._active_list_id)
+        if order is None:
+            return
+
+        # Entry just filled
+        if not self._entry_filled and order.status == "ENTRY_FILLED":
+            self._entry_filled = True
+            self._active_actual_entry = order.avg_fill_price
+            self.account = replace(self.account, open_positions=1)
+            logger.info(
+                f"[PAPER] Entry filled: {self._active_strategy_name} "
+                f"@ {self._active_actual_entry:.2f} (signal was {self._active_signal_entry:.2f})"
+            )
+            return
+
+        # Exit fill (SL or TP)
+        if self._active_list_id in filled_ids and order.status in ("STOP_HIT", "TP_HIT"):
+            self._close_position(order.status, order.exit_fill_price)
+
+    def _process_fills_exchange(self, now) -> None:
+        """Poll Binance testnet for order status updates."""
+        try:
+            entry_cid = self._active_list_id + "-entry"
+            result = self.adapter.get_order_status(self.settings.symbol, entry_cid)
+        except Exception as e:
+            logger.error(f"[TESTNET] Order status poll failed: {e}")
+            return
+
+        if result.status == "FILLED" and not self._entry_filled:
+            self._entry_filled = True
+            self._active_actual_entry = result.avg_price if result.avg_price > 0 else self._active_signal_entry
+            self.account = replace(self.account, open_positions=1)
+            logger.info(
+                f"[TESTNET] Entry filled: {self._active_strategy_name} "
+                f"@ {self._active_actual_entry:.2f}"
+            )
+
+        # Exit monitoring via open-orders check (user-data stream not yet wired)
+        if self._entry_filled:
+            try:
+                open_orders = self.adapter.get_open_orders(self.settings.symbol)
+                open_cids = {o.client_order_id for o in open_orders}
+                # If neither SL nor TP order is open anymore, the position closed
+                sl_cid = self._active_list_id + "-sl"
+                tp_cid = self._active_list_id + "-tp"
+                if sl_cid not in open_cids and tp_cid not in open_cids:
+                    logger.info(
+                        f"[TESTNET] Exit detected for {self._active_list_id} — "
+                        "protection orders gone (best-effort close, no exit price available)"
+                    )
+                    # Use current market approximation — imprecise without user-data stream
+                    self._close_position("TESTNET_EXIT", self._active_actual_entry)
+            except Exception as e:
+                logger.error(f"[TESTNET] Open orders check failed: {e}")
+
+    def _close_position(self, exit_reason: str, exit_price: float) -> None:
+        """Record trade PnL, update account state, and persist close to DB."""
+        if exit_price <= 0:
+            logger.error(f"[PAPER] Exit fill price missing for {self._active_list_id}, skipping close")
+            return
+
+        # Use actual fill price at entry, not the signal price
+        entry_price = self._active_actual_entry if self._active_actual_entry > 0 else self._active_signal_entry
+        fees = (self._active_qty * entry_price * self.settings.fee_per_side_pct
+                + self._active_qty * exit_price * self.settings.fee_per_side_pct)
+        pnl = (exit_price - entry_price) * self._active_qty - fees
+
+        self.account = record_trade_result(self.account, pnl, self.limits)
+        self.account = replace(self.account, open_positions=0)
+
+        self._daily_stats["trades"] += 1
+        self._daily_stats["pnl"] += pnl
+        if pnl >= 0:
+            self._daily_stats["wins"] += 1
+        else:
+            self._daily_stats["losses"] += 1
+
+        logger.info(
+            f"[PAPER] CLOSED {self._active_strategy_name} {exit_reason} "
+            f"entry={entry_price:.2f} exit={exit_price:.2f} "
+            f"pnl={pnl:+.2f} USDT | equity={self.account.equity:.2f}"
+        )
+
+        if self._active_trade_db_id is not None:
+            try:
+                with self._session() as s:
+                    from btc_bot.storage.models import Trade
+                    from btc_bot.storage.repos import close_trade, create_order
+                    trade_obj = s.query(Trade).filter_by(id=self._active_trade_db_id).first()
+                    if trade_obj is not None:
+                        exit_order = create_order(
+                            s, self._active_list_id + "-exit",
+                            self.settings.symbol, "SELL", "PAPER_EXIT",
+                            self._active_qty, exit_price,
+                        )
+                        s.flush()
+                        close_trade(s, trade_obj, exit_order.id, exit_price, exit_reason, fees)
+                    set_state(s, "open_trade", {})
+            except Exception as e:
+                logger.error(f"Failed to persist trade close: {e}")
+
+        self._reset_active_state()
+
+    def _reset_active_state(self) -> None:
+        self._active_list_id = None
+        self._active_trade_db_id = None
+        self._active_strategy_name = None
+        self._active_signal_entry = 0.0
+        self._active_actual_entry = 0.0
+        self._active_qty = 0.0
+        self._active_stop = 0.0
+        self._entry_filled = False
+        self._pending_since = None
 
     def _persist_signal(self, signal, decision) -> None:
         with self._session() as s:

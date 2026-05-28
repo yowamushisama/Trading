@@ -94,10 +94,10 @@ class RiskEngine:
             return Decision.reject(reason)
 
         # ── Gate 10: Per-trade risk cap ───────────────────────────
-        if risk_pct > self.account_limits.daily_loss_cap_pct:
+        if risk_pct > self.account_limits.max_risk_per_trade_pct:
             return Decision.reject(
-                f"risk_pct {risk_pct:.4%} > daily_loss_cap "
-                f"{self.account_limits.daily_loss_cap_pct:.4%}"
+                f"risk_pct {risk_pct:.4%} > max_risk_per_trade "
+                f"{self.account_limits.max_risk_per_trade_pct:.4%}"
             )
 
         # ── Gate 11: Stop must exist and be valid ─────────────────
@@ -132,6 +132,7 @@ class RiskEngine:
             stop=signal.stop,
             risk_pct=risk_pct,
             filters=filters,
+            max_pct=self.account_limits.max_risk_per_trade_pct,
         )
         if not sizing.ok:
             return Decision.reject(f"Sizing: {sizing.reason}")
